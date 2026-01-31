@@ -1,0 +1,23 @@
+# --- 1. Python Bytecode (ไฟล์ขยะที่ Python สร้างเอง) ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- 2. Virtual Environments (ห้ามเอาขึ้นเด็ดขาด) ---
+.venv/
+env/
+venv/
+ENV/
+
+# --- 3. IDE & Editors (การตั้งค่าส่วนตัวของ VS Code) ---
+.vscode/
+.idea/
+*.swp
+
+# --- 4. OS Files (ไฟล์ขยะของ Windows/Mac) ---
+.DS_Store
+Thumbs.db
+
+# --- 5. Project Logs & Checkpoints ---
+*.log
+.ipynb_checkpoints/
