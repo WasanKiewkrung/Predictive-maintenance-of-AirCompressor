@@ -1,0 +1,211 @@
+timestamp
+{
+  "timestamp": "YYYY-MM-DD HH:MM:SS.ms",
+  "ax": float,
+  "ay": float,
+  "az": float,
+  "temp": float,
+  "amp": float,
+  "rul_predict": float,
+  "status": int (0=Normal, 1=Abnormal)
+}
+
+backend
+
+import asyncio
+import json
+import threading
+from typing import List
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+import paho.mqtt.client as mqtt
+from . import database  # เรียกใช้ database.py ตัวเดิม
+
+app = FastAPI()
+
+# --- 1. การตั้งค่า MQTT (Config) ---
+# ใช้ Public Broker สำหรับทดสอบ (ถ้าใช้ตัวอื่นแก้ตรงนี้ได้เลย)
+MQTT_BROKER = "test.mosquitto.org"
+MQTT_PORT = 1883
+MQTT_TOPIC = "factory/compressor/data" 
+
+# ตัวแปร Global สำหรับเก็บ Loop ของ Asyncio (เอาไว้ข้าม Thread)
+main_loop = None
+
+# --- 2. Setup CORS ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- 3. Connection Manager (WebSocket Hub สำหรับ Frontend) ---
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+
+    async def broadcast(self, data: dict):
+        for connection in self.active_connections:
+            try:
+                await connection.send_json(data)
+            except Exception:
+                pass
+
+manager = ConnectionManager()
+
+# --- 4. MQTT Client Setup (ส่วนรับข้อมูลจาก NXP Board) ---
+mqtt_client = mqtt.Client()
+
+def on_connect(client, userdata, flags, rc):
+    print(f"📡 MQTT Connected with result code {rc}")
+    client.subscribe(MQTT_TOPIC)
+    print(f"👂 Subscribed to topic: {MQTT_TOPIC}")
+
+def on_message(client, userdata, msg):
+    """
+    ฟังก์ชันนี้จะทำงานทันทีที่ NXP Board ส่งข้อมูลมาทาง MQTT
+    """
+    try:
+        # 1. แปลงข้อมูลจาก MQTT (Bytes) เป็น Dictionary (Python)
+        payload = msg.payload.decode()
+        data = json.loads(payload)
+        
+        # print(f"📥 Received: {data}") # Debug ดูข้อมูลได้ที่นี่
+
+        # 2. บันทึกลง Database (SQLite)
+        # (Database จะจัดการ Auto Cleanup ให้เองถ้าเขียน logic ไว้แล้ว)
+        database.insert_data_sqlite(data)
+
+        # 3. ส่งต่อให้ Frontend (Bridge Logic)
+        # เนื่องด้วย MQTT รันคนละ Thread กับ FastAPI เราต้องใช้ท่านี้เพื่อส่งข้อมูลข้ามไป
+        if main_loop and main_loop.is_running():
+            asyncio.run_coroutine_threadsafe(manager.broadcast(data), main_loop)
+            
+    except json.JSONDecodeError:
+        print("⚠️ Error: Received non-JSON data from MQTT")
+    except Exception as e:
+        print(f"⚠️ Error processing MQTT message: {e}")
+
+# ผูกฟังก์ชัน Callback เข้ากับตัว Client
+mqtt_client.on_connect = on_connect
+mqtt_client.on_message = on_message
+
+# --- 5. Startup / Shutdown Events ---
+@app.on_event("startup")
+async def startup_event():
+    global main_loop
+    # เก็บ Loop หลักไว้ใช้ส่งข้อมูลข้าม Thread
+    main_loop = asyncio.get_running_loop()
+    
+    # เริ่มต้น Database
+    database.init_db()
+    print("✅ System Ready: Database Initialized.")
+
+    # เริ่มเชื่อมต่อ MQTT (Non-blocking)
+    try:
+        mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+        mqtt_client.loop_start() # รันใน Background Thread
+        print("🚀 MQTT Client Started")
+    except Exception as e:
+        print(f"❌ Failed to connect to MQTT Broker: {e}")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    # ปิดการเชื่อมต่อเมื่อหยุด Server
+    mqtt_client.loop_stop()
+    mqtt_client.disconnect()
+    print("🛑 MQTT Client Stopped")
+
+# --- 6. WebSocket Endpoint (สำหรับ Frontend เท่านั้น) ---
+@app.websocket("/ws/frontend")
+async def websocket_frontend(websocket: WebSocket):
+    await manager.connect(websocket)
+    print("💻 Frontend Joined Dashboard")
+    try:
+        while True:
+            # รอรับ Ping/Pong จาก Frontend เพื่อรักษา Connection
+            await websocket.receive_text() 
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+        print("💻 Frontend Left Dashboard")
+
+@app.get("/")
+def read_root():
+    return {
+        "status": "Online", 
+        "mode": "Production (MQTT Real Data)", 
+        "broker": MQTT_BROKER,
+        "topic": MQTT_TOPIC
+    }
+
+database
+
+import sqlite3
+import os
+from datetime import datetime, timedelta
+
+# ชื่อไฟล์ Database สำหรับดูประวัติย้อนหลังบนเว็บ
+DB_NAME = "maintenance_logs.db"
+
+# --- ส่วนของ SQLite (เก็บ Log ย้อนหลัง 7 วัน สำหรับ Web Dashboard) ---
+
+def init_db():
+    """สร้างตารางใน Database ถ้ายังไม่มี"""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    # สร้างตารางเก็บผลลัพธ์ (รองรับ Status 0/1)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS sensor_summary (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp DATETIME,
+            ax REAL, ay REAL, az REAL, 
+            temp REAL, amp REAL, 
+            rul_predict REAL,
+            status INTEGER
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def insert_data_sqlite(data):
+    """บันทึกข้อมูลลง SQLite"""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        INSERT INTO sensor_summary (timestamp, ax, ay, az, temp, amp, rul_predict, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        data['timestamp'], 
+        data['ax'], data['ay'], data['az'], 
+        data['temp'], data['amp'], 
+        data['rul_predict'],
+        data['status']
+    ))
+    
+    conn.commit()
+    conn.close()
+
+def cleanup_old_sqlite_data():
+    """ลบ Log ใน Database ที่เก่ากว่า 7 วัน"""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    
+    # ลบแถวที่เวลาเก่าเกิน 7 วัน
+    cursor.execute("DELETE FROM sensor_summary WHERE timestamp < datetime('now', '-7 days')")
+    
+    deleted_count = cursor.rowcount
+    if deleted_count > 0:
+        print(f"🧹 History Cleaner: Removed {deleted_count} old records.")
+        
+    conn.commit()
+    conn.close()
